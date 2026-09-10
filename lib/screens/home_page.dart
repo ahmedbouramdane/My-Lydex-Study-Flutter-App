@@ -1,4 +1,8 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../core/settings_controller.dart';
@@ -7,6 +11,15 @@ import '../widgets/app_drawer.dart';
 import '../widgets/loading_screen.dart';
 import 'settings_page.dart';
 
+/// How far along the loading of [baseUrl] is.
+enum _LoadStatus { loading, ready, error }
+
+/// The website loaded in the WebView.
+///
+/// Designed to stay robust on desktop (Windows): the page is never hidden
+/// behind an animated overlay once loaded, a watchdog reports a stuck or blank
+/// load instead of showing a white screen forever, and the user can always
+/// fall back to the system browser.
 class HomePage extends StatefulWidget {
   final SettingsController settings;
 
@@ -23,9 +36,18 @@ class _HomePageState extends State<HomePage> {
   late final WebViewController _controller;
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
-  bool _isLoaded = false;
+  _LoadStatus _status = _LoadStatus.loading;
+  late String _errorMessage;
+  Timer? _watchdog;
+
   late int _currentSection;
   bool _didRestoreSection = false;
+
+  bool get _isDesktop =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.windows ||
+          defaultTargetPlatform == TargetPlatform.linux ||
+          defaultTargetPlatform == TargetPlatform.macOS);
 
   @override
   void initState() {
@@ -41,15 +63,32 @@ class _HomePageState extends State<HomePage> {
       ..setBackgroundColor(Colors.white)
       ..setNavigationDelegate(
         NavigationDelegate(
+          onPageStarted: (_) {
+            if (mounted && _status != _LoadStatus.loading) {
+              setState(() {
+                _status = _LoadStatus.loading;
+                _errorMessage = '';
+                _didRestoreSection = false;
+              });
+            }
+            _armWatchdog();
+          },
           onPageFinished: (_) {
+            _armWatchdog();
             _syncWebTheme();
             _restoreSection();
-            Future.delayed(const Duration(milliseconds: 300), () {
-              if (mounted) setState(() => _isLoaded = true);
-            });
+            _probeLoadedContent();
           },
           onWebResourceError: (error) {
-            debugPrint('WebView error: ${error.description}');
+            // A failing sub-resource is not fatal, but a failing main frame
+            // means the page can never appear.
+            if (error.isForMainFrame && _status != _LoadStatus.ready) {
+              debugPrint('WebView error: ${error.description}');
+              _failLoad(
+                'Impossible de charger le site.\n'
+                '${error.description}',
+              );
+            }
           },
         ),
       )
@@ -61,8 +100,94 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    _watchdog?.cancel();
     widget.settings.removeListener(_syncWebTheme);
     super.dispose();
+  }
+
+  /// Cancels any pending watch and starts a fresh timeout for the current
+  /// navigation. A stuck page switches to the rescue screen instead of
+  /// leaving (or revealing) a blank view.
+  void _armWatchdog() {
+    _watchdog?.cancel();
+    if (_status == _LoadStatus.error) return;
+    _watchdog = Timer(
+      Duration(seconds: _isDesktop ? 12 : 20),
+      () {
+        if (!mounted) return;
+        if (_status != _LoadStatus.ready) {
+          _failLoad(
+            'Le site met trop de temps à répondre. '
+            'Vérifiez votre connexion internet, puis réessayez.',
+          );
+        }
+      },
+    );
+  }
+
+  void _failLoad(String message) {
+    if (!mounted) return;
+    _watchdog?.cancel();
+    setState(() {
+      _status = _LoadStatus.error;
+      _errorMessage = message;
+    });
+  }
+
+  /// After a successful load, reads back a snippet of the rendered page. If
+  /// the browser returned an empty body (blank/white page), we surface a
+  /// rescue screen instead of staring at whiteness.
+  Future<void> _probeLoadedContent() async {
+    try {
+      final snippet = await _controller
+          .runJavaScriptReturningResult(
+            'document.body && document.body.innerText'
+                ' ? document.body.innerText.replace(/\\s+/g, " ").trim().slice(0, 60)'
+                ' : "EMPTY_BODY"',
+          )
+          .timeout(const Duration(seconds: 3));
+      if (!mounted) return;
+      final text = snippet.toString();
+      if (text == 'EMPTY_BODY') {
+        _failLoad(
+          'La page s\'est chargée mais ne contient aucun contenu. '
+          'Ouvrez le site dans votre navigateur ou réessayez.',
+        );
+        return;
+      }
+      setState(() => _status = _LoadStatus.ready);
+    } catch (_) {
+      // Probe failed, but the page still finished. Trust onPageFinished.
+      if (!mounted) return;
+      setState(() => _status = _LoadStatus.ready);
+    }
+  }
+
+  /// Hard reload of the site, re-arming the watchdog and section restore.
+  Future<void> _reloadSite() async {
+    setState(() {
+      _status = _LoadStatus.loading;
+      _errorMessage = '';
+      _didRestoreSection = false;
+    });
+    _armWatchdog();
+    _controller.loadRequest(Uri.parse(baseUrl));
+  }
+
+  /// Opens the site in the system's default browser (escape hatch used from
+  /// the recovery screen and the app bar).
+  Future<void> _openInBrowser() async {
+    final ok = await launchUrl(
+      Uri.parse(baseUrl),
+      mode: LaunchMode.externalApplication,
+    );
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Impossible d\'ouvrir le navigateur.'),
+        ),
+      );
+    }
   }
 
   /// After the page loads, jump to the last visited section by updating the
@@ -143,12 +268,12 @@ class _HomePageState extends State<HomePage> {
 
     return Scaffold(
       key: _scaffoldKey,
-      backgroundColor: const Color(0xFF0D47A1),
+      backgroundColor: isDark ? const Color(0xFF121212) : const Color(0xFF0D47A1),
       appBar: AppBar(
         backgroundColor: appBarColor,
         foregroundColor: Colors.white,
         elevation: 0,
-        centerTitle: true,
+        centerTitle: !_isDesktop,
         title: const _AppBarTitle(),
         leading: IconButton(
           icon: const Icon(Icons.menu_rounded),
@@ -157,8 +282,13 @@ class _HomePageState extends State<HomePage> {
         ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.open_in_browser_rounded),
+            onPressed: _openInBrowser,
+            tooltip: 'Ouvrir dans le navigateur',
+          ),
+          IconButton(
             icon: const Icon(Icons.refresh_rounded),
-            onPressed: () => _controller.reload(),
+            onPressed: _status == _LoadStatus.error ? _reloadSite : _controller.reload,
             tooltip: 'Refresh',
           ),
         ],
@@ -174,22 +304,40 @@ class _HomePageState extends State<HomePage> {
         builder: (context, _) {
           return Stack(
             children: [
+              // The WebView is always mounted and painted at the bottom of the
+              // stack; once loaded, nothing renders above it (overlay widgets
+              // rare on desktop) to avoid platform-view painting glitches.
               WebViewWidget(controller: _controller),
-              AnimatedOpacity(
-                opacity: _isLoaded ? 0.0 : 1.0,
-                duration: const Duration(milliseconds: 400),
-                child: IgnorePointer(
-                  ignoring: _isLoaded,
-                  child: _isLoaded
-                      ? const SizedBox.shrink()
-                      : const LoadingScreen(),
+              if (_status == _LoadStatus.loading) _buildLoadingOverlay(),
+              if (_status == _LoadStatus.error)
+                _ErrorPanel(
+                  message: _errorMessage,
+                  onRetry: _reloadSite,
+                  onOpenBrowser: _openInBrowser,
                 ),
-              ),
             ],
           );
         },
       ),
     );
+  }
+
+  /// Loading presentation. Desktop gets a slim progress bar so the user keeps
+  /// seeing the (still empty) WebView; mobile keeps the immersive screen.
+  Widget _buildLoadingOverlay() {
+    if (_isDesktop) {
+      return const Align(
+        alignment: Alignment.topCenter,
+        child: LinearProgressIndicator(minHeight: 3),
+      );
+    }
+    return const Positioned.fill(child: LoadingScreen());
+  }
+
+  @override
+  void debugFillProperties(DiagnosticPropertiesBuilder properties) {
+    super.debugFillProperties(properties);
+    properties.add(EnumProperty<_LoadStatus>('status', _status));
   }
 }
 
@@ -212,6 +360,104 @@ class _AppBarTitle extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+/// Full-screen recovery card shown when the site cannot be loaded (stuck,
+/// blank, or network error). Offers a retry and an escape to the browser so
+/// desktop users never face an un-labelled white window.
+class _ErrorPanel extends StatelessWidget {
+  final String message;
+  final VoidCallback onRetry;
+  final VoidCallback onOpenBrowser;
+
+  const _ErrorPanel({
+    required this.message,
+    required this.onRetry,
+    required this.onOpenBrowser,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Positioned.fill(
+      child: Container(
+        color: isDark ? const Color(0xFF16181D) : const Color(0xFFF7F8FA),
+        alignment: Alignment.center,
+        padding: const EdgeInsets.all(24),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 460),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(24, 28, 24, 24),
+            decoration: BoxDecoration(
+              color: isDark ? const Color(0xFF22252C) : Colors.white,
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(
+                color: isDark ? const Color(0xFF2E323A) : const Color(0xFFE4E4E7),
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.cloud_off_rounded,
+                  size: 44,
+                  color: isDark ? Colors.white70 : const Color(0xFF5F6368),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Le site n\'a pas pu être chargé',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: isDark ? Colors.white : const Color(0xFF202124),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 13,
+                    height: 1.5,
+                    color: isDark ? Colors.white70 : const Color(0xFF5F6368),
+                  ),
+                ),
+                const SizedBox(height: 22),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: onOpenBrowser,
+                        icon: const Icon(Icons.open_in_new_rounded, size: 18),
+                        label: const Text('Ouvrir dans le navigateur'),
+                        style: OutlinedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: onRetry,
+                        icon: const Icon(Icons.refresh_rounded, size: 18),
+                        label: const Text('Réessayer'),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: const Color(0xFF1A73E8),
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
